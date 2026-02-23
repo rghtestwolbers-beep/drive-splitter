@@ -5,24 +5,21 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
+app.use(express.json());
+
 app.get("/", (req, res) => res.send("ok"));
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.use(express.json({ limit: "20mb" })); // body is small (only fileId), keep it low
 
 const PORT = process.env.PORT || 8080;
 const BUCKET = process.env.BUCKET;
-
 const storage = new Storage();
 
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-app.post("/split", async (req, res) => {
+async function splitHandler(req, res) {
   try {
-    const { fileId, segmentSeconds = 120 } = req.body;
+    const { fileId, maxChunkMB = 24, bitrateKbps = 64 } = req.body;
     if (!fileId) return res.status(400).json({ error: "Missing fileId" });
     if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
 
-    // Auth using Cloud Run service account (n8n-splitter-sa)
     const auth = new google.auth.GoogleAuth({
       scopes: ["https://www.googleapis.com/auth/drive.readonly"],
     });
@@ -31,52 +28,57 @@ app.post("/split", async (req, res) => {
     const workDir = `/tmp/${fileId}`;
     fs.mkdirSync(workDir, { recursive: true });
 
-    const inputPath = `${workDir}/input`;
-    const audioPath = `${workDir}/audio.mp3`;
-    const chunksDir = `${workDir}/chunks`;
-    fs.mkdirSync(chunksDir, { recursive: true });
+    const input = `${workDir}/input`;
+    const audio = `${workDir}/audio.mp3`;
+    const outDir = `${workDir}/chunks`;
+    fs.mkdirSync(outDir, { recursive: true });
 
-    // Download file from Drive
-    const dl = await drive.files.get(
-      { fileId, alt: "media" },
-      { responseType: "stream" }
-    );
-
+    // download from Drive
+    const response = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
     await new Promise((resolve, reject) => {
-      const dest = fs.createWriteStream(inputPath);
-      dl.data.pipe(dest);
+      const dest = fs.createWriteStream(input);
+      response.data.pipe(dest);
       dest.on("finish", resolve);
       dest.on("error", reject);
     });
 
-    // Extract audio
-    execSync(`ffmpeg -y -i "${inputPath}" -vn -acodec libmp3lame "${audioPath}"`, { stdio: "ignore" });
+    // encode audio at target bitrate
+    execSync(`ffmpeg -y -i "${input}" -vn -ac 1 -ar 44100 -b:a ${bitrateKbps}k "${audio}"`, { stdio: "ignore" });
 
-    // Split into chunks
+    // estimate segment duration to keep chunks under maxChunkMB
+    const maxBytes = maxChunkMB * 1024 * 1024;
+    const bytesPerSec = (bitrateKbps * 1000) / 8;
+    const segmentSeconds = Math.max(15, Math.floor(maxBytes / bytesPerSec)); // minimum 15s
+
     execSync(
-      `ffmpeg -y -i "${audioPath}" -f segment -segment_time ${segmentSeconds} -c copy "${chunksDir}/part_%03d.mp3"`,
+      `ffmpeg -y -i "${audio}" -f segment -segment_time ${segmentSeconds} -c copy "${outDir}/part_%03d.mp3"`,
       { stdio: "ignore" }
     );
 
-    const files = fs.readdirSync(chunksDir).filter(f => f.endsWith(".mp3")).sort();
+    const files = fs.readdirSync(outDir).filter(f => f.endsWith(".mp3")).sort();
     const urls = [];
 
     for (const file of files) {
       const destination = `chunks/${fileId}/${file}`;
-      await storage.bucket(BUCKET).upload(`${chunksDir}/${file}`, { destination });
+      await storage.bucket(BUCKET).upload(`${outDir}/${file}`, { destination });
 
+      // IMPORTANT: this needs iam.serviceAccounts.signBlob permission (you already hit this)
       const [url] = await storage.bucket(BUCKET).file(destination).getSignedUrl({
         action: "read",
-        expires: Date.now() + 60 * 60 * 1000, // 1 hour
+        expires: Date.now() + 3600 * 1000,
       });
 
       urls.push({ file, url });
     }
 
-    res.json({ fileId, segmentSeconds, count: urls.length, chunks: urls });
+    return res.json({ fileId, maxChunkMB, bitrateKbps, segmentSeconds, count: urls.length, chunks: urls });
   } catch (e) {
-    res.status(500).json({ error: e.message || String(e) });
+    return res.status(500).json({ error: e?.message || String(e) });
   }
-});
+}
 
-app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+// accept BOTH endpoints
+app.post("/split", splitHandler);
+app.post("/split-video", splitHandler);
+
+app.listen(PORT, () => console.log(`Running on ${PORT}`));
