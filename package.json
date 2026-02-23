@@ -1,7 +1,6 @@
 {
-  "name": "drive-audio-splitter",
+  "name": "drive-splitter",
   "version": "1.0.0",
-  "main": "server.js",
   "type": "module",
   "dependencies": {
     "@google-cloud/storage": "^7.12.0",
