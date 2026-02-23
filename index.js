@@ -1,6 +1,3 @@
-app.get("/", (req, res) => res.send("ok"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
 import express from "express";
 import fs from "fs";
 import { execSync } from "child_process";
@@ -8,6 +5,8 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
+app.get("/", (req, res) => res.send("ok"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 app.use(express.json({ limit: "20mb" })); // body is small (only fileId), keep it low
 
 const PORT = process.env.PORT || 8080;
