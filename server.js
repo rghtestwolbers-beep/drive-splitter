@@ -5,6 +5,8 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
+app.get("/", (req, res) => res.send("ok"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
