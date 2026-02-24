@@ -6,7 +6,8 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+// Captions requests can be large; raise this so you don't hit 413.
+app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 8080;
 const BUCKET = process.env.BUCKET;
@@ -40,17 +41,79 @@ function estimateSegmentSeconds(inputPath, maxChunkMB) {
   return Math.max(5, Math.floor(maxSeconds * 0.85)); // safety margin
 }
 
+async function downloadDriveFileToPath(fileId, outPath) {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
+  });
+  const drive = google.drive({ version: "v3", auth });
+
+  const dl = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
+
+  await new Promise((resolve, reject) => {
+    const dest = fs.createWriteStream(outPath);
+    dl.data.pipe(dest);
+    dest.on("finish", resolve);
+    dest.on("error", reject);
+  });
+}
+
+function srtTime(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  const ms = Math.round((s - Math.floor(s)) * 1000);
+
+  const pad = (n, w = 2) => String(n).padStart(w, "0");
+  return `${pad(h)}:${pad(m)}:${pad(sec)},${pad(ms, 3)}`;
+}
+
+function buildSrtFromSegments(segments) {
+  return segments
+    .filter((s) => s && s.text && Number(s.end) > Number(s.start))
+    .map((s, i) => {
+      const start = srtTime(s.start);
+      const end = srtTime(s.end);
+      const text = String(s.text).replace(/\r?\n+/g, " ").trim();
+      return `${i + 1}\n${start} --> ${end}\n${text}\n`;
+    })
+    .join("\n");
+}
+
+/**
+ * Burn subtitles into video using ffmpeg.
+ * NOTE: ffmpeg subtitles filter uses libass; your image must include ffmpeg with libass.
+ */
+function burnSubtitlesToVideo({ inputPath, srtPath, outputPath, fontSize, bottomMargin }) {
+  // Force-style works when libass is available.
+  const vf = `subtitles=${srtPath}:force_style='FontSize=${fontSize},MarginV=${bottomMargin}'`;
+
+  execSync(
+    `ffmpeg -y -i "${inputPath}" -vf "${vf}" ` +
+      `-c:v libx264 -preset veryfast -crf 18 ` +
+      `-c:a aac -b:a 192k -movflags +faststart "${outputPath}"`,
+    { stdio: "ignore" }
+  );
+}
+
+async function uploadToGcsAndSign(localPath, destination) {
+  if (!BUCKET) throw new Error("Missing BUCKET env var");
+
+  await storage.bucket(BUCKET).upload(localPath, { destination });
+
+  const [url] = await storage.bucket(BUCKET).file(destination).getSignedUrl({
+    action: "read",
+    expires: Date.now() + 60 * 60 * 1000, // 1 hour
+  });
+
+  return url;
+}
+
 app.post("/split-video", async (req, res) => {
   try {
     const { fileId, maxChunkMB = 24 } = req.body;
     if (!fileId) return res.status(400).json({ error: "Missing fileId" });
     if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
-
-    // Drive auth (Cloud Run service account)
-    const auth = new google.auth.GoogleAuth({
-      scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-    });
-    const drive = google.drive({ version: "v3", auth });
 
     const workDir = `/tmp/${fileId}`;
     fs.mkdirSync(workDir, { recursive: true });
@@ -60,17 +123,7 @@ app.post("/split-video", async (req, res) => {
     fs.mkdirSync(outDir, { recursive: true });
 
     // Download from Drive
-    const dl = await drive.files.get(
-      { fileId, alt: "media" },
-      { responseType: "stream" }
-    );
-
-    await new Promise((resolve, reject) => {
-      const dest = fs.createWriteStream(inputPath);
-      dl.data.pipe(dest);
-      dest.on("finish", resolve);
-      dest.on("error", reject);
-    });
+    await downloadDriveFileToPath(fileId, inputPath);
 
     // Decide segment duration based on bitrate
     const segmentSeconds = estimateSegmentSeconds(inputPath, maxChunkMB);
@@ -82,7 +135,7 @@ app.post("/split-video", async (req, res) => {
       { stdio: "ignore" }
     );
 
-    const files = fs.readdirSync(outDir).filter(f => f.endsWith(".mp4")).sort();
+    const files = fs.readdirSync(outDir).filter((f) => f.endsWith(".mp4")).sort();
     const chunks = [];
 
     for (const file of files) {
@@ -121,32 +174,35 @@ app.post("/render-captions", async (req, res) => {
     if (!Array.isArray(segments) || segments.length === 0) {
       return res.status(400).json({ error: "Missing segments[]" });
     }
+    if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
 
-    // 1) Download original video from Drive
-    const inputPath = "/tmp/input.mp4";
-    await downloadDriveFileToPath(fileId, inputPath);
-
-    // 2) Build SRT
-    const srtPath = "/tmp/captions.srt";
-    const srtText = buildSrtFromSegments(segments);
-    require("fs").writeFileSync(srtPath, srtText, "utf8");
-
-    // 3) Burn subtitles with ffmpeg
-    const outputPath = "/tmp/output.mp4";
     const fontSize = style?.fontSize ?? 48;
     const bottomMargin = style?.bottomMargin ?? 80;
 
-    await runFfmpegBurn(inputPath, srtPath, outputPath, { fontSize, bottomMargin });
+    const workDir = `/tmp/${fileId}-render`;
+    fs.mkdirSync(workDir, { recursive: true });
 
-    // 4) Upload output to GCS
-    const gcsKey = `captioned/${fileId}/output.mp4`;
-    const signedUrl = await uploadToGcsAndSign(outputPath, gcsKey);
+    const inputPath = `${workDir}/input.mp4`;
+    const srtPath = `${workDir}/captions.srt`;
+    const outputPath = `${workDir}/output.mp4`;
 
-    // 5) Return url
-    return res.json({ fileId, output: { file: "output.mp4", url: signedUrl } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: String(err?.message || err) });
+    // 1) Download original video from Drive
+    await downloadDriveFileToPath(fileId, inputPath);
+
+    // 2) Write SRT
+    fs.writeFileSync(srtPath, buildSrtFromSegments(segments), "utf8");
+
+    // 3) Burn subtitles
+    burnSubtitlesToVideo({ inputPath, srtPath, outputPath, fontSize, bottomMargin });
+
+    // 4) Upload output to GCS + return signed URL
+    const destination = `captioned/${fileId}/output.mp4`;
+    const url = await uploadToGcsAndSign(outputPath, destination);
+
+    return res.json({ fileId, output: { file: "output.mp4", url } });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: e?.message || String(e) });
   }
 });
 
