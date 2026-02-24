@@ -1,3 +1,11 @@
+// server.js (ESM)
+// ✅ Fixes:
+// - Better subtitle styling for vertical video (no huge text)
+// - Optional automatic time-offset per chunk (solves “captions too early”)
+// - Safer SRT generation (sorting + sanitize newlines)
+// - Escapes paths for ffmpeg subtitles filter
+// - More robust defaults + useful debug output
+
 import express from "express";
 import fs from "fs";
 import path from "path";
@@ -6,7 +14,8 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
-// Captions requests can be large; raise this so you don't hit 413.
+
+// Captions payload can be large
 app.use(express.json({ limit: "25mb" }));
 
 const PORT = process.env.PORT || 8080;
@@ -33,10 +42,7 @@ function estimateSegmentSeconds(inputPath, maxChunkMB) {
   );
   const info = JSON.parse(json);
   const bitRate = Number(info?.format?.bit_rate || 0); // bits/sec
-  if (!bitRate || bitRate <= 0) {
-    // fallback: 30s chunks if bitrate unknown
-    return 30;
-  }
+  if (!bitRate || bitRate <= 0) return 30; // fallback
   const maxSeconds = (maxBytes * 8) / bitRate; // seconds
   return Math.max(5, Math.floor(maxSeconds * 0.85)); // safety margin
 }
@@ -47,7 +53,10 @@ async function downloadDriveFileToPath(fileId, outPath) {
   });
   const drive = google.drive({ version: "v3", auth });
 
-  const dl = await drive.files.get({ fileId, alt: "media" }, { responseType: "stream" });
+  const dl = await drive.files.get(
+    { fileId, alt: "media" },
+    { responseType: "stream" }
+  );
 
   await new Promise((resolve, reject) => {
     const dest = fs.createWriteStream(outPath);
@@ -68,26 +77,151 @@ function srtTime(seconds) {
   return `${pad(h)}:${pad(m)}:${pad(sec)},${pad(ms, 3)}`;
 }
 
-function buildSrtFromSegments(segments) {
+/**
+ * Optional: wrap long lines for nicer captions (2 lines max-ish)
+ * Simple wrapper; you can tune maxLen.
+ */
+function wrapCaption(text, maxLen = 32) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  if (t.length <= maxLen) return t;
+
+  const words = t.split(" ");
+  const lines = [];
+  let line = "";
+  for (const w of words) {
+    const candidate = line ? `${line} ${w}` : w;
+    if (candidate.length <= maxLen) line = candidate;
+    else {
+      if (line) lines.push(line);
+      line = w;
+      if (lines.length === 1) break; // keep ~2 lines max
+    }
+  }
+  if (line && lines.length < 2) lines.push(line);
+
+  return lines.join("\n");
+}
+
+/**
+ * Build SRT from segments.
+ * Expected segment shape:
+ * { start:number, end:number, text:string }
+ *
+ * Supports optional chunk offsets:
+ * - If segment has { chunkIndex } and request provides segmentSeconds,
+ *   and request has applyChunkOffsets=true, we shift timestamps:
+ *   start += chunkIndex * segmentSeconds
+ */
+function normalizeSegments({
+  segments,
+  applyChunkOffsets = false,
+  segmentSeconds = 0,
+  globalOffsetSeconds = 0,
+}) {
+  const segSec = Number(segmentSeconds) || 0;
+  const globalOff = Number(globalOffsetSeconds) || 0;
+
+  return (
+    (Array.isArray(segments) ? segments : [])
+      // normalize + clean
+      .map((s) => {
+        const start = Number(s?.start);
+        const end = Number(s?.end);
+        const text = s?.text;
+
+        const chunkIndex = Number(s?.chunkIndex);
+        const chunkOff =
+          applyChunkOffsets && Number.isFinite(chunkIndex) && segSec > 0
+            ? chunkIndex * segSec
+            : 0;
+
+        return {
+          start: (Number.isFinite(start) ? start : 0) + chunkOff + globalOff,
+          end: (Number.isFinite(end) ? end : 0) + chunkOff + globalOff,
+          text: String(text ?? "").trim(),
+        };
+      })
+      // keep only valid ranges
+      .filter((s) => s.text && s.end > s.start)
+      // sort by time (important!)
+      .sort((a, b) => a.start - b.start || a.end - b.end)
+  );
+}
+
+function buildSrtFromSegments(segments, { wrap = true, maxLineLen = 32 } = {}) {
   return segments
-    .filter((s) => s && s.text && Number(s.end) > Number(s.start))
     .map((s, i) => {
       const start = srtTime(s.start);
       const end = srtTime(s.end);
-      const text = String(s.text).replace(/\r?\n+/g, " ").trim();
-      return `${i + 1}\n${start} --> ${end}\n${text}\n`;
+      const clean = String(s.text)
+        .replace(/\r/g, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      const finalText = wrap ? wrapCaption(clean, maxLineLen) : clean;
+
+      return `${i + 1}\n${start} --> ${end}\n${finalText}\n`;
     })
     .join("\n");
 }
 
 /**
- * Burn subtitles into video using ffmpeg.
- * NOTE: ffmpeg subtitles filter uses libass; your image must include ffmpeg with libass.
+ * ffmpeg subtitles filter path escaping.
+ * libass expects special escaping for ':' and '\' on some platforms.
+ * (Linux is usually ok, but this makes it safer.)
  */
-function burnSubtitlesToVideo({ inputPath, srtPath, outputPath, fontSize, bottomMargin }) {
-  // Force-style works when libass is available.
-  const vf = `subtitles=${srtPath}:force_style='FontSize=${fontSize},MarginV=${bottomMargin}'`;
+function escapeForFfmpegSubtitlesFilter(p) {
+  // Use forward slashes and escape ':' and '\'
+  return p.replace(/\\/g, "/").replace(/:/g, "\\:");
+}
 
+/**
+ * Burn subtitles into video using ffmpeg.
+ * Uses libass styling. Good defaults for vertical social video.
+ */
+function burnSubtitlesToVideo({
+  inputPath,
+  srtPath,
+  outputPath,
+  style = {},
+}) {
+  // Good defaults for vertical video (TikTok/Reels)
+  const fontSize = Number(style.fontSize ?? 18); // ✅ much smaller default
+  const bottomMargin = Number(style.bottomMargin ?? 60);
+  const outline = Number(style.outline ?? 2);
+  const shadow = Number(style.shadow ?? 0);
+  const alignment = Number(style.alignment ?? 2); // 2 = bottom-center
+
+  // Optional: pick a font name available in container
+  const fontName = style.fontName ? String(style.fontName) : null;
+
+  // Optional: text color; ASS uses &HAABBGGRR (alpha, blue, green, red)
+  // White = &H00FFFFFF. We'll keep default white.
+  const primaryColour = style.primaryColour
+    ? String(style.primaryColour)
+    : null;
+
+  const srtEscaped = escapeForFfmpegSubtitlesFilter(srtPath);
+
+  const styleParts = [
+    `FontSize=${fontSize}`,
+    `MarginV=${bottomMargin}`,
+    `Outline=${outline}`,
+    `Shadow=${shadow}`,
+    `Alignment=${alignment}`,
+    // Improve readability
+    `BorderStyle=1`,
+    `Bold=1`,
+  ];
+  if (fontName) styleParts.push(`FontName=${fontName}`);
+  if (primaryColour) styleParts.push(`PrimaryColour=${primaryColour}`);
+
+  const forceStyle = styleParts.join(",");
+
+  const vf = `subtitles='${srtEscaped}':force_style='${forceStyle}'`;
+
+  // Re-encode video to burn captions reliably
   execSync(
     `ffmpeg -y -i "${inputPath}" -vf "${vf}" ` +
       `-c:v libx264 -preset veryfast -crf 18 ` +
@@ -109,6 +243,8 @@ async function uploadToGcsAndSign(localPath, destination) {
   return url;
 }
 
+// -------------------- SPLIT --------------------
+
 app.post("/split-video", async (req, res) => {
   try {
     const { fileId, maxChunkMB = 24 } = req.body;
@@ -129,7 +265,6 @@ app.post("/split-video", async (req, res) => {
     const segmentSeconds = estimateSegmentSeconds(inputPath, maxChunkMB);
 
     // Split MP4 (copy streams, no re-encode)
-    // Note: keyframes matter; some parts may slightly exceed. If you need strict size, re-encode.
     execSync(
       `ffmpeg -y -i "${inputPath}" -c copy -map 0 -f segment -segment_time ${segmentSeconds} -reset_timestamps 1 "${outDir}/part_%03d.mp4"`,
       { stdio: "ignore" }
@@ -166,18 +301,41 @@ app.post("/split-video", async (req, res) => {
   }
 });
 
+// -------------------- RENDER CAPTIONS --------------------
+
+/**
+ * POST /render-captions
+ *
+ * Body:
+ * {
+ *   "fileId": "driveFileId",
+ *   "segments": [{start,end,text, (optional chunkIndex)}...],
+ *   "style": { fontSize, bottomMargin, outline, alignment, shadow, fontName },
+ *   "applyChunkOffsets": true/false,
+ *   "segmentSeconds": 17,            // needed if applyChunkOffsets=true + chunkIndex exists
+ *   "globalOffsetSeconds": 0.0,      // optional tweak (+ delays, - earlier)
+ *   "wrap": true,
+ *   "maxLineLen": 32
+ * }
+ */
 app.post("/render-captions", async (req, res) => {
   try {
-    const { fileId, segments, style } = req.body;
+    const {
+      fileId,
+      segments,
+      style,
+      applyChunkOffsets = false,
+      segmentSeconds = 0,
+      globalOffsetSeconds = 0,
+      wrap = true,
+      maxLineLen = 32,
+    } = req.body;
 
     if (!fileId) return res.status(400).json({ error: "Missing fileId" });
     if (!Array.isArray(segments) || segments.length === 0) {
       return res.status(400).json({ error: "Missing segments[]" });
     }
     if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
-
-    const fontSize = style?.fontSize ?? 48;
-    const bottomMargin = style?.bottomMargin ?? 80;
 
     const workDir = `/tmp/${fileId}-render`;
     fs.mkdirSync(workDir, { recursive: true });
@@ -189,17 +347,44 @@ app.post("/render-captions", async (req, res) => {
     // 1) Download original video from Drive
     await downloadDriveFileToPath(fileId, inputPath);
 
-    // 2) Write SRT
-    fs.writeFileSync(srtPath, buildSrtFromSegments(segments), "utf8");
+    // 2) Normalize segments (sorting + optional time offsets)
+    const normalized = normalizeSegments({
+      segments,
+      applyChunkOffsets,
+      segmentSeconds,
+      globalOffsetSeconds,
+    });
 
-    // 3) Burn subtitles
-    burnSubtitlesToVideo({ inputPath, srtPath, outputPath, fontSize, bottomMargin });
+    // 3) Write SRT
+    fs.writeFileSync(
+      srtPath,
+      buildSrtFromSegments(normalized, { wrap, maxLineLen }),
+      "utf8"
+    );
 
-    // 4) Upload output to GCS + return signed URL
+    // 4) Burn subtitles (better defaults for vertical video)
+    burnSubtitlesToVideo({
+      inputPath,
+      srtPath,
+      outputPath,
+      style: style ?? {},
+    });
+
+    // 5) Upload output to GCS + return signed URL
     const destination = `captioned/${fileId}/output.mp4`;
     const url = await uploadToGcsAndSign(outputPath, destination);
 
-    return res.json({ fileId, output: { file: "output.mp4", url } });
+    return res.json({
+      fileId,
+      output: { file: "output.mp4", url },
+      debug: {
+        segmentsReceived: segments.length,
+        segmentsUsed: normalized.length,
+        applyChunkOffsets,
+        segmentSeconds,
+        globalOffsetSeconds,
+      },
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e?.message || String(e) });
