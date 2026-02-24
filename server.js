@@ -113,4 +113,41 @@ app.post("/split-video", async (req, res) => {
   }
 });
 
+app.post("/render-captions", async (req, res) => {
+  try {
+    const { fileId, segments, style } = req.body;
+
+    if (!fileId) return res.status(400).json({ error: "Missing fileId" });
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return res.status(400).json({ error: "Missing segments[]" });
+    }
+
+    // 1) Download original video from Drive
+    const inputPath = "/tmp/input.mp4";
+    await downloadDriveFileToPath(fileId, inputPath);
+
+    // 2) Build SRT
+    const srtPath = "/tmp/captions.srt";
+    const srtText = buildSrtFromSegments(segments);
+    require("fs").writeFileSync(srtPath, srtText, "utf8");
+
+    // 3) Burn subtitles with ffmpeg
+    const outputPath = "/tmp/output.mp4";
+    const fontSize = style?.fontSize ?? 48;
+    const bottomMargin = style?.bottomMargin ?? 80;
+
+    await runFfmpegBurn(inputPath, srtPath, outputPath, { fontSize, bottomMargin });
+
+    // 4) Upload output to GCS
+    const gcsKey = `captioned/${fileId}/output.mp4`;
+    const signedUrl = await uploadToGcsAndSign(outputPath, gcsKey);
+
+    // 5) Return url
+    return res.json({ fileId, output: { file: "output.mp4", url: signedUrl } });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
 app.listen(PORT, () => console.log(`Running on ${PORT}`));
