@@ -314,24 +314,9 @@ app.post("/split-video", async (req, res) => {
 
 // -------------------- RENDER CAPTIONS --------------------
 
-/**
- * POST /render-captions
- *
- * Body:
- * {
- *   "fileId": "driveFileId",
- *   "segments": [{start,end,text, (optional chunkIndex)}...],
- *   "style": { fontSize, bottomMargin, outline, alignment, shadow, fontName },
- *   "applyChunkOffsets": true/false,
- *   "segmentSeconds": 17,            // needed if applyChunkOffsets=true + chunkIndex exists
- *   "globalOffsetSeconds": 0.0,      // optional tweak (+ delays, - earlier)
- *   "wrap": true,
- *   "maxLineLen": 32
- * }
- */
 app.post("/render-captions", async (req, res) => {
   try {
-    const {
+    let {
       fileId,
       segments,
       style,
@@ -342,11 +327,26 @@ app.post("/render-captions", async (req, res) => {
       maxLineLen = 32,
     } = req.body;
 
-    if (!fileId) return res.status(400).json({ error: "Missing fileId" });
+    // ✅ Accept segments as JSON string (from n8n) or real array
+    if (typeof segments === "string") {
+      try {
+        segments = JSON.parse(segments);
+      } catch {
+        return res.status(400).json({ error: "Invalid segments JSON" });
+      }
+    }
+
+    if (!fileId) {
+      return res.status(400).json({ error: "Missing fileId" });
+    }
+
     if (!Array.isArray(segments) || segments.length === 0) {
       return res.status(400).json({ error: "Missing segments[]" });
     }
-    if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
+
+    if (!BUCKET) {
+      return res.status(500).json({ error: "Missing BUCKET env var" });
+    }
 
     const workDir = `/tmp/${fileId}-render`;
     fs.mkdirSync(workDir, { recursive: true });
@@ -355,10 +355,10 @@ app.post("/render-captions", async (req, res) => {
     const srtPath = `${workDir}/captions.srt`;
     const outputPath = `${workDir}/output.mp4`;
 
-    // 1) Download original video from Drive
+    // 1️⃣ Download original video
     await downloadDriveFileToPath(fileId, inputPath);
 
-    // 2) Normalize segments (sorting + optional time offsets)
+    // 2️⃣ Normalize + sort segments
     const normalized = normalizeSegments({
       segments,
       applyChunkOffsets,
@@ -366,14 +366,14 @@ app.post("/render-captions", async (req, res) => {
       globalOffsetSeconds,
     });
 
-    // 3) Write SRT
+    // 3️⃣ Write SRT
     fs.writeFileSync(
       srtPath,
       buildSrtFromSegments(normalized, { wrap, maxLineLen }),
       "utf8"
     );
 
-    // 4) Burn subtitles (better defaults for vertical video)
+    // 4️⃣ Burn subtitles
     burnSubtitlesToVideo({
       inputPath,
       srtPath,
@@ -381,7 +381,7 @@ app.post("/render-captions", async (req, res) => {
       style: style ?? {},
     });
 
-    // 5) Upload output to GCS + return signed URL
+    // 5️⃣ Upload result
     const destination = `captioned/${fileId}/output.mp4`;
     const url = await uploadToGcsAndSign(outputPath, destination);
 
@@ -401,5 +401,3 @@ app.post("/render-captions", async (req, res) => {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 });
-
-app.listen(PORT, () => console.log(`Running on ${PORT}`));
