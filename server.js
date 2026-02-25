@@ -187,8 +187,9 @@ function burnSubtitlesToVideo({
   style = {},
 }) {
   // Good defaults for vertical video (TikTok/Reels)
-  const fontSize = Number(style.fontSize ?? 18); // ✅ much smaller default
-  const bottomMargin = Number(style.bottomMargin ?? 60);
+// Better defaults for 1080x1920 vertical video
+const fontSize = Number(style.fontSize ?? 44);
+const bottomMargin = Number(style.bottomMargin ?? 160);
   const outline = Number(style.outline ?? 2);
   const shadow = Number(style.shadow ?? 0);
   const alignment = Number(style.alignment ?? 2); // 2 = bottom-center
@@ -204,23 +205,33 @@ function burnSubtitlesToVideo({
 
   const srtEscaped = escapeForFfmpegSubtitlesFilter(srtPath);
 
-  const styleParts = [
-    `FontSize=${fontSize}`,
-    `MarginV=${bottomMargin}`,
-    `Outline=${outline}`,
-    `Shadow=${shadow}`,
-    `Alignment=${alignment}`,
-    // Improve readability
-    `BorderStyle=1`,
-    `Bold=1`,
-  ];
+const marginLR = Number(style.marginLR ?? 80);
+
+const styleParts = [
+  `FontSize=${fontSize}`,
+  `MarginV=${bottomMargin}`,
+  `MarginL=${marginLR}`,
+  `MarginR=${marginLR}`,
+  `Outline=${outline}`,
+  `Shadow=${shadow}`,
+  `Alignment=${alignment}`,
+  `BorderStyle=1`,
+  `Bold=1`,
+];
   if (fontName) styleParts.push(`FontName=${fontName}`);
   if (primaryColour) styleParts.push(`PrimaryColour=${primaryColour}`);
 
   const forceStyle = styleParts.join(",");
 
-  const vf = `subtitles='${srtEscaped}':force_style='${forceStyle}'`;
+// Detect video size so libass scales correctly (prevents giant text)
+const probe = execSync(
+  `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of json "${inputPath}"`,
+  { encoding: "utf8" }
+);
+const { width, height } = JSON.parse(probe).streams[0];
 
+// IMPORTANT: original_size makes FontSize behave consistently
+const vf = `subtitles='${srtEscaped}':original_size=${width}x${height}:force_style='${forceStyle}'`;
   // Re-encode video to burn captions reliably
   execSync(
     `ffmpeg -y -i "${inputPath}" -vf "${vf}" ` +
