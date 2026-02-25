@@ -169,7 +169,8 @@ function buildAss({ width, height, events, style }) {
   // Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,
   // Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle,
   // BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-  const PrimaryColour = style.primaryColor || "&H00FFFFFF&"; // white
+  const PrimaryColour = style.highlightColor || "&H00FFFFFF&"; // highlight color
+  const SecondaryColour = style.baseColor || "&H00FFFFFF&";   // base text color
   const OutlineColour = style.outlineColor || "&H00000000&"; // black
   const BackColour = style.backColor || "&H64000000&"; // slightly transparent black (mostly unused with BorderStyle=1)
   const Bold = style.bold === false ? 0 : 1;
@@ -183,7 +184,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Default,${font},${fontSize},${PrimaryColour},&H000000FF&,${OutlineColour},${BackColour},${Bold},0,0,0,100,100,0,0,1,${outline},${shadow},${alignment},80,80,${marginV},1
+Style: Default,${font},${fontSize},${PrimaryColour},${SecondaryColour},${OutlineColour},${BackColour},${Bold},0,0,0,100,100,0,0,1,${outline},${shadow},${alignment},80,80,${marginV},1
 
 [Events]
 Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
