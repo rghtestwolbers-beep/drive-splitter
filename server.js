@@ -73,39 +73,6 @@ function wrapToTwoLines(text, maxLineLen = 28) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
   if (!t) return "";
 
-  
-  // Rebalance so line2 isn't too short (prevents 1-word second line)
-  while (
-    line2.length > 0 &&
-    line2.join(" ").length < Math.floor(maxLen * 0.45) &&
-    line1.length > 2
-  ) {
-    line2.unshift(line1.pop());
-  }
-
-  if (!line2.length) return line1.join(" ");
-  return `${line1.join(" ")}\\N${line2.join(" ")}`; // ASS newline
-}
-
-  // Better TikTok-style 2-line balancing (prevents huge single-line captions)
-function balanceTwoLines(text, maxLen = 20) {
-  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (words.length <= 2) return words.join(" ");
-
-  let line1 = [];
-  let line2 = [];
-  let len = 0;
-
-  for (const w of words) {
-    const add = (line1.length ? 1 : 0) + w.length;
-    if (len + add <= maxLen) {
-      line1.push(w);
-      len += add;
-    } else {
-      line2.push(w);
-    }
-  }
-  
   // If already has line breaks, compress to <=2 lines
   const parts = t.split(/\n+/).map((x) => x.trim()).filter(Boolean);
   if (parts.length >= 2) return `${parts[0]}\n${parts[1]}`;
@@ -132,6 +99,38 @@ function balanceTwoLines(text, maxLen = 20) {
   }
 
   return `${line1}\n${line2}`;
+}
+
+// Better TikTok-style 2-line balancing (prevents huge single-line captions)
+function balanceTwoLines(text, maxLen = 20) {
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (words.length <= 2) return words.join(" ");
+
+  let line1 = [];
+  let line2 = [];
+  let len = 0;
+
+  for (const w of words) {
+    const add = (line1.length ? 1 : 0) + w.length;
+    if (len + add <= maxLen) {
+      line1.push(w);
+      len += add;
+    } else {
+      line2.push(w);
+    }
+  }
+
+  // Rebalance so line2 isn't too short (prevents 1-word second line)
+  while (
+    line2.length > 0 &&
+    line2.join(" ").length < Math.floor(maxLen * 0.45) &&
+    line1.length > 2
+  ) {
+    line2.unshift(line1.pop());
+  }
+
+  if (!line2.length) return line1.join(" ");
+  return `${line1.join(" ")}\\N${line2.join(" ")}`; // ASS newline
 }
 
 // ASS timestamp format: H:MM:SS.cc (centiseconds)
