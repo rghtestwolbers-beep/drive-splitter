@@ -1,250 +1,206 @@
 // server.js (ESM)
-// ✅ Fixes:
-// - Better subtitle styling for vertical video (no huge text)
-// - Optional automatic time-offset per chunk (solves “captions too early”)
-// - Safer SRT generation (sorting + sanitize newlines)
-// - Escapes paths for ffmpeg subtitles filter
-// - More robust defaults + useful debug output
+// Caption renderer for n8n pipeline (Drive -> Cloud Run -> GCS signed URL)
 
 import express from "express";
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
-
-// Captions payload can be large
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 8080;
 const BUCKET = process.env.BUCKET;
+const OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "captioned";
 
 const storage = new Storage();
 
 app.get("/", (_, res) => res.send("ok"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-function bytesToMB(bytes) {
-  return bytes / 1024 / 1024;
+function safeMkdir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+function safeRmdir(p) {
+  try {
+    fs.rmSync(p, { recursive: true, force: true });
+  } catch {}
 }
 
-/**
- * Estimate a safe segment_time (seconds) so each MP4 chunk stays under maxChunkMB.
- * Uses ffprobe to get bitrate. Adds a safety margin (0.85).
- */
-function estimateSegmentSeconds(inputPath, maxChunkMB) {
-  const maxBytes = maxChunkMB * 1024 * 1024;
-  const json = execSync(
-    `ffprobe -v error -print_format json -show_format "${inputPath}"`,
+function ffprobeJson(filePath) {
+  const out = execSync(
+    `ffprobe -v error -print_format json -show_format -show_streams "${filePath}"`,
     { encoding: "utf8" }
   );
-  const info = JSON.parse(json);
-  const bitRate = Number(info?.format?.bit_rate || 0); // bits/sec
-  if (!bitRate || bitRate <= 0) return 30; // fallback
-  const maxSeconds = (maxBytes * 8) / bitRate; // seconds
-  return Math.max(5, Math.floor(maxSeconds * 0.85)); // safety margin
+  return JSON.parse(out);
 }
 
-async function downloadDriveFileToPath(fileId, outPath) {
+function getVideoInfo(filePath) {
+  try {
+    const info = ffprobeJson(filePath);
+    const v = (info?.streams || []).find((s) => s.codec_type === "video");
+    const width = Number(v?.width) || null;
+    const height = Number(v?.height) || null;
+    const durationSec = Number(info?.format?.duration);
+    return {
+      width,
+      height,
+      durationSec: Number.isFinite(durationSec) ? durationSec : null,
+    };
+  } catch {
+    return { width: null, height: null, durationSec: null };
+  }
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function srtTime(t) {
+  const msTotal = Math.max(0, Math.round(t * 1000));
+  const ms = msTotal % 1000;
+  const sTotal = Math.floor(msTotal / 1000);
+  const s = sTotal % 60;
+  const mTotal = Math.floor(sTotal / 60);
+  const m = mTotal % 60;
+  const h = Math.floor(mTotal / 60);
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)},${String(ms).padStart(3, "0")}`;
+}
+
+// Minimal wrapping: enforce max 2 lines, try to keep within maxLineLen
+function wrapToTwoLines(text, maxLineLen = 28) {
+  const t = String(text || "").trim().replace(/\s+/g, " ");
+  if (!t) return "";
+
+  // If already has line breaks, compress to <=2 lines
+  const parts = t.split(/\n+/).map((x) => x.trim()).filter(Boolean);
+  if (parts.length >= 2) return `${parts[0]}\n${parts[1]}`;
+
+  // If short enough, return as is
+  if (t.length <= maxLineLen) return t;
+
+  // Break on nearest space around midpoint, then re-wrap second line if needed
+  const mid = Math.floor(t.length / 2);
+  let cut = t.lastIndexOf(" ", mid);
+  if (cut < 0) cut = t.indexOf(" ", mid);
+  if (cut < 0) return t; // no spaces
+
+  const line1 = t.slice(0, cut).trim();
+  let line2 = t.slice(cut + 1).trim();
+
+  // If second line still too long, try another cut inside line2
+  if (line2.length > maxLineLen) {
+    const mid2 = Math.floor(line2.length / 2);
+    let cut2 = line2.lastIndexOf(" ", mid2);
+    if (cut2 < 0) cut2 = line2.indexOf(" ", mid2);
+    if (cut2 > 0) line2 = line2.slice(0, cut2).trim() + "…";
+    else line2 = line2.slice(0, maxLineLen - 1).trim() + "…";
+  }
+
+  return `${line1}\n${line2}`;
+}
+
+// ASS timestamp format: H:MM:SS.cc (centiseconds)
+function assTime(t) {
+  const csTotal = Math.max(0, Math.round(t * 100)); // centiseconds
+  const cs = csTotal % 100;
+  const sTotal = Math.floor(csTotal / 100);
+  const s = sTotal % 60;
+  const mTotal = Math.floor(sTotal / 60);
+  const m = mTotal % 60;
+  const h = Math.floor(mTotal / 60);
+  return `${h}:${pad2(m)}:${pad2(s)}.${String(cs).padStart(2, "0")}`;
+}
+
+// ASS colors are BBGGRR (&HBBGGRR&). We'll keep defaults.
+function buildAss({ width, height, events, style }) {
+  const PlayResX = width || 1080;
+  const PlayResY = height || 1920;
+
+  const font = style.font || "Arial";
+  const alignment = Number(style.alignment ?? 2); // 2 = bottom-center
+  const outline = Number(style.outline ?? 3);
+  const shadow = Number(style.shadow ?? 0);
+
+  // Resolution-aware defaults if not provided:
+  const fontSize =
+    style.fontSize != null
+      ? Number(style.fontSize)
+      : Math.round(PlayResY * 0.06); // ~6% of height
+  const marginV =
+    style.bottomMargin != null
+      ? Number(style.bottomMargin)
+      : Math.round(PlayResY * 0.09); // ~9% of height
+
+  // ASS style fields:
+  // Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,
+  // Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle,
+  // BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+  const PrimaryColour = style.primaryColor || "&H00FFFFFF&"; // white
+  const OutlineColour = style.outlineColor || "&H00000000&"; // black
+  const BackColour = style.backColor || "&H64000000&"; // slightly transparent black (mostly unused with BorderStyle=1)
+  const Bold = style.bold === false ? 0 : 1;
+
+  const header = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${PlayResX}
+PlayResY: ${PlayResY}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: Default,${font},${fontSize},${PrimaryColour},&H000000FF&,${OutlineColour},${BackColour},${Bold},0,0,0,100,100,0,0,1,${outline},${shadow},${alignment},80,80,${marginV},1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+`;
+
+  const body = events
+    .map((e) => {
+      const txt = String(e.text || "")
+        .replace(/\r/g, "")
+        .replace(/\n/g, "\\N") // ASS newline
+        .replace(/{/g, "\\{")
+        .replace(/}/g, "\\}");
+      return `Dialogue: 0,${assTime(e.start)},${assTime(e.end)},Default,,0,0,0,,${txt}`;
+    })
+    .join("\n");
+
+  return header + body + "\n";
+}
+
+// 🔹 Download video from Google Drive
+async function downloadDriveFile(fileId, outputPath) {
   const auth = new google.auth.GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
   });
+
   const drive = google.drive({ version: "v3", auth });
 
-  const dl = await drive.files.get(
+  const response = await drive.files.get(
     { fileId, alt: "media" },
     { responseType: "stream" }
   );
 
   await new Promise((resolve, reject) => {
-    const dest = fs.createWriteStream(outPath);
-    dl.data.pipe(dest);
+    const dest = fs.createWriteStream(outputPath);
+    response.data.pipe(dest);
     dest.on("finish", resolve);
     dest.on("error", reject);
   });
 }
 
-function srtTime(seconds) {
-  const s = Math.max(0, Number(seconds) || 0);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  const ms = Math.round((s - Math.floor(s)) * 1000);
-
-  const pad = (n, w = 2) => String(n).padStart(w, "0");
-  return `${pad(h)}:${pad(m)}:${pad(sec)},${pad(ms, 3)}`;
-}
-
-/**
- * Optional: wrap long lines for nicer captions (2 lines max-ish)
- * Simple wrapper; you can tune maxLen.
- */
-function wrapCaption(text, maxLen = 32) {
-  const t = String(text || "").replace(/\s+/g, " ").trim();
-  if (!t) return "";
-  if (t.length <= maxLen) return t;
-
-  const words = t.split(" ");
-  const lines = [];
-  let line = "";
-  for (const w of words) {
-    const candidate = line ? `${line} ${w}` : w;
-    if (candidate.length <= maxLen) line = candidate;
-    else {
-      if (line) lines.push(line);
-      line = w;
-      if (lines.length === 1) break; // keep ~2 lines max
-    }
-  }
-  if (line && lines.length < 2) lines.push(line);
-
-  return lines.join("\n");
-}
-
-/**
- * Build SRT from segments.
- * Expected segment shape:
- * { start:number, end:number, text:string }
- *
- * Supports optional chunk offsets:
- * - If segment has { chunkIndex } and request provides segmentSeconds,
- *   and request has applyChunkOffsets=true, we shift timestamps:
- *   start += chunkIndex * segmentSeconds
- */
-function normalizeSegments({
-  segments,
-  applyChunkOffsets = false,
-  segmentSeconds = 0,
-  globalOffsetSeconds = 0,
-}) {
-  const segSec = Number(segmentSeconds) || 0;
-  const globalOff = Number(globalOffsetSeconds) || 0;
-
-  return (
-    (Array.isArray(segments) ? segments : [])
-      // normalize + clean
-      .map((s) => {
-        const start = Number(s?.start);
-        const end = Number(s?.end);
-        const text = s?.text;
-
-        const chunkIndex = Number(s?.chunkIndex);
-        const chunkOff =
-          applyChunkOffsets && Number.isFinite(chunkIndex) && segSec > 0
-            ? chunkIndex * segSec
-            : 0;
-
-        return {
-          start: (Number.isFinite(start) ? start : 0) + chunkOff + globalOff,
-          end: (Number.isFinite(end) ? end : 0) + chunkOff + globalOff,
-          text: String(text ?? "").trim(),
-        };
-      })
-      // keep only valid ranges
-      .filter((s) => s.text && s.end > s.start)
-      // sort by time (important!)
-      .sort((a, b) => a.start - b.start || a.end - b.end)
-  );
-}
-
-function buildSrtFromSegments(segments, { wrap = true, maxLineLen = 32 } = {}) {
-  return segments
-    .map((s, i) => {
-      const start = srtTime(s.start);
-      const end = srtTime(s.end);
-      const clean = String(s.text)
-        .replace(/\r/g, "")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-
-      const finalText = wrap ? wrapCaption(clean, maxLineLen) : clean;
-
-      return `${i + 1}\n${start} --> ${end}\n${finalText}\n`;
-    })
-    .join("\n");
-}
-
-/**
- * ffmpeg subtitles filter path escaping.
- * libass expects special escaping for ':' and '\' on some platforms.
- * (Linux is usually ok, but this makes it safer.)
- */
-function escapeForFfmpegSubtitlesFilter(p) {
-  // Use forward slashes and escape ':' and '\'
-  return p.replace(/\\/g, "/").replace(/:/g, "\\:");
-}
-
-/**
- * Burn subtitles into video using ffmpeg.
- * Uses libass styling. Good defaults for vertical social video.
- */
-function burnSubtitlesToVideo({
-  inputPath,
-  srtPath,
-  outputPath,
-  style = {},
-}) {
-  // Good defaults for vertical video (TikTok/Reels)
-// Better defaults for 1080x1920 vertical video
-const fontSize = Number(style.fontSize ?? 44);
-const bottomMargin = Number(style.bottomMargin ?? 160);
-  const outline = Number(style.outline ?? 2);
-  const shadow = Number(style.shadow ?? 0);
-  const alignment = Number(style.alignment ?? 2); // 2 = bottom-center
-
-  // Optional: pick a font name available in container
-  const fontName = style.fontName ? String(style.fontName) : null;
-
-  // Optional: text color; ASS uses &HAABBGGRR (alpha, blue, green, red)
-  // White = &H00FFFFFF. We'll keep default white.
-  const primaryColour = style.primaryColour
-    ? String(style.primaryColour)
-    : null;
-
-  const srtEscaped = escapeForFfmpegSubtitlesFilter(srtPath);
-
-const marginLR = Number(style.marginLR ?? 80);
-
-const styleParts = [
-  `FontSize=${fontSize}`,
-  `MarginV=${bottomMargin}`,
-  `MarginL=${marginLR}`,
-  `MarginR=${marginLR}`,
-  `Outline=${outline}`,
-  `Shadow=${shadow}`,
-  `Alignment=${alignment}`,
-  `BorderStyle=1`,
-  `Bold=1`,
-];
-  if (fontName) styleParts.push(`FontName=${fontName}`);
-  if (primaryColour) styleParts.push(`PrimaryColour=${primaryColour}`);
-
-  const forceStyle = styleParts.join(",");
-
-// Detect video size so libass scales correctly (prevents giant text)
-const probe = execSync(
-  `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of json "${inputPath}"`,
-  { encoding: "utf8" }
-);
-const { width, height } = JSON.parse(probe).streams[0];
-
-// IMPORTANT: original_size makes FontSize behave consistently
-const vf = `subtitles='${srtEscaped}':original_size=${width}x${height}:force_style='${forceStyle}'`;
-  // Re-encode video to burn captions reliably
-  execSync(
-    `ffmpeg -y -i "${inputPath}" -vf "${vf}" ` +
-      `-c:v libx264 -preset veryfast -crf 18 ` +
-      `-c:a aac -b:a 192k -movflags +faststart "${outputPath}"`,
-    { stdio: "ignore" }
-  );
-}
-
-async function uploadToGcsAndSign(localPath, destination) {
+// 🔹 Upload to GCS + signed URL
+async function uploadAndSign(localPath, destination) {
   if (!BUCKET) throw new Error("Missing BUCKET env var");
 
-  await storage.bucket(BUCKET).upload(localPath, { destination });
+  await storage.bucket(BUCKET).upload(localPath, {
+    destination,
+    resumable: false,
+    validation: false,
+  });
 
   const [url] = await storage.bucket(BUCKET).file(destination).getSignedUrl({
     action: "read",
@@ -254,150 +210,177 @@ async function uploadToGcsAndSign(localPath, destination) {
   return url;
 }
 
-// -------------------- SPLIT --------------------
+function normalizeSegments(rawSegments, opts) {
+  const segments = Array.isArray(rawSegments) ? rawSegments : [];
 
-app.post("/split-video", async (req, res) => {
-  try {
-    const { fileId, maxChunkMB = 24 } = req.body;
-    if (!fileId) return res.status(400).json({ error: "Missing fileId" });
-    if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
+  const chunkSeconds = Number(opts.chunkSeconds ?? 0); // if using chunkIndex offsets
+  const defaultOffset = Number(opts.offsetSeconds ?? 0);
 
-    const workDir = `/tmp/${fileId}`;
-    fs.mkdirSync(workDir, { recursive: true });
+  const out = segments
+    .map((s) => {
+      const start = Number(s.start);
+      const end = Number(s.end);
+      const text = String(s.text || "").trim();
 
-    const inputPath = `${workDir}/input.mp4`;
-    const outDir = `${workDir}/chunks`;
-    fs.mkdirSync(outDir, { recursive: true });
+      const chunkIndex = s.chunkIndex != null ? Number(s.chunkIndex) : null;
+      const extra =
+        Number.isFinite(chunkSeconds) && chunkSeconds > 0 && Number.isFinite(chunkIndex)
+          ? chunkIndex * chunkSeconds
+          : 0;
 
-    // Download from Drive
-    await downloadDriveFileToPath(fileId, inputPath);
+      const offset = Number.isFinite(defaultOffset) ? defaultOffset : 0;
 
-    // Decide segment duration based on bitrate
-    const segmentSeconds = estimateSegmentSeconds(inputPath, maxChunkMB);
+      return {
+        start: (Number.isFinite(start) ? start : 0) + extra + offset,
+        end: (Number.isFinite(end) ? end : 0) + extra + offset,
+        text,
+      };
+    })
+    .filter((s) => s.text && s.end > s.start)
+    .sort((a, b) => a.start - b.start);
 
-    // Split MP4 (copy streams, no re-encode)
-    execSync(
-      `ffmpeg -y -i "${inputPath}" -c copy -map 0 -f segment -segment_time ${segmentSeconds} -reset_timestamps 1 "${outDir}/part_%03d.mp4"`,
-      { stdio: "ignore" }
-    );
-
-    const files = fs.readdirSync(outDir).filter((f) => f.endsWith(".mp4")).sort();
-    const chunks = [];
-
-    for (const file of files) {
-      const localPath = path.join(outDir, file);
-      const sizeMB = bytesToMB(fs.statSync(localPath).size);
-
-      const destination = `video_chunks/${fileId}/${file}`;
-      await storage.bucket(BUCKET).upload(localPath, { destination });
-
-      const [url] = await storage.bucket(BUCKET).file(destination).getSignedUrl({
-        action: "read",
-        expires: Date.now() + 60 * 60 * 1000,
-      });
-
-      chunks.push({ file, sizeMB: Number(sizeMB.toFixed(2)), url });
-    }
-
-    res.json({
-      fileId,
-      maxChunkMB,
-      segmentSeconds,
-      count: chunks.length,
-      chunks,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e?.message || String(e) });
+  // Clamp negatives and tiny weirdness
+  for (const s of out) {
+    if (s.start < 0) s.start = 0;
+    if (s.end < 0) s.end = 0;
+    if (s.end <= s.start) s.end = s.start + 0.2;
   }
-});
 
-// -------------------- RENDER CAPTIONS --------------------
+  return out;
+}
 
+/**
+ * POST /render-captions
+ * Body:
+ * {
+ *   "fileId": "driveVideoId",
+ *   "segments": [{start,end,text,chunkIndex?}, ...],
+ *   "style": { font, fontSize, outline, shadow, bottomMargin, alignment, bold, maxLineLen, wrap },
+ *   "wrap": true,
+ *   "maxLineLen": 28,
+ *   "chunkSeconds": 0,       // optional, for chunkIndex timing correction
+ *   "offsetSeconds": 0       // optional
+ * }
+ */
 app.post("/render-captions", async (req, res) => {
+  const startedAt = Date.now();
+  const { fileId } = req.body || {};
+  let { segments } = req.body || {};
+
+  const style = req.body?.style || {};
+  const wrap = req.body?.wrap ?? true;
+  const maxLineLen = Number(req.body?.maxLineLen ?? style.maxLineLen ?? 28);
+
+  if (!fileId) return res.status(400).json({ error: "Missing fileId" });
+  if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
+
+  // Handle case where segments arrived stringified
+  if (typeof segments === "string") {
+    try {
+      segments = JSON.parse(segments);
+    } catch {
+      return res.status(400).json({ error: "segments is a string but not valid JSON" });
+    }
+  }
+  if (!Array.isArray(segments)) {
+    return res.status(400).json({
+      error: "segments must be an array",
+      got: typeof segments,
+    });
+  }
+
+  const workDir = `/tmp/${fileId}-render`;
+  const inputPath = path.join(workDir, "input.mp4");
+  const assPath = path.join(workDir, "subs.ass");
+  const outputPath = path.join(workDir, "captioned.mp4");
+
   try {
-    let {
-      fileId,
-      segments,
-      style,
-      applyChunkOffsets = false,
-      segmentSeconds = 0,
-      globalOffsetSeconds = 0,
-      wrap = true,
-      maxLineLen = 32,
-    } = req.body;
+    safeMkdir(workDir);
 
-    // ✅ Accept segments as JSON string (from n8n) or real array
-    if (typeof segments === "string") {
-      try {
-        segments = JSON.parse(segments);
-      } catch {
-        return res.status(400).json({ error: "Invalid segments JSON" });
-      }
+    // 1) Download original video
+    await downloadDriveFile(fileId, inputPath);
+
+    // 2) Probe for resolution (for auto font sizing)
+    const info = getVideoInfo(inputPath);
+
+    // 3) Normalize segments + wrap text
+    const normalized = normalizeSegments(segments, {
+      chunkSeconds: req.body?.chunkSeconds,
+      offsetSeconds: req.body?.offsetSeconds,
+    }).map((s) => ({
+      ...s,
+      text: wrap ? wrapToTwoLines(s.text, maxLineLen) : s.text,
+    }));
+
+    if (!normalized.length) {
+      return res.status(400).json({ error: "No usable segments after normalization" });
     }
 
-    if (!fileId) {
-      return res.status(400).json({ error: "Missing fileId" });
-    }
-
-    if (!Array.isArray(segments) || segments.length === 0) {
-      return res.status(400).json({ error: "Missing segments[]" });
-    }
-
-    if (!BUCKET) {
-      return res.status(500).json({ error: "Missing BUCKET env var" });
-    }
-
-    const workDir = `/tmp/${fileId}-render`;
-    fs.mkdirSync(workDir, { recursive: true });
-
-    const inputPath = `${workDir}/input.mp4`;
-    const srtPath = `${workDir}/captions.srt`;
-    const outputPath = `${workDir}/output.mp4`;
-
-    // 1️⃣ Download original video
-    await downloadDriveFileToPath(fileId, inputPath);
-
-    // 2️⃣ Normalize + sort segments
-    const normalized = normalizeSegments({
-      segments,
-      applyChunkOffsets,
-      segmentSeconds,
-      globalOffsetSeconds,
+    // 4) Build ASS + write to disk
+    const ass = buildAss({
+      width: info.width,
+      height: info.height,
+      events: normalized,
+      style: {
+        ...style,
+        maxLineLen,
+      },
     });
+    fs.writeFileSync(assPath, ass, "utf8");
 
-    // 3️⃣ Write SRT
-    fs.writeFileSync(
-      srtPath,
-      buildSrtFromSegments(normalized, { wrap, maxLineLen }),
-      "utf8"
-    );
-
-    // 4️⃣ Burn subtitles
-    burnSubtitlesToVideo({
+    // 5) Burn subtitles using libass
+    // Re-encode video for compatibility + faststart
+    const vf = `ass=${assPath.replace(/\\/g, "/")}`;
+    const ffArgs = [
+      "-y",
+      "-i",
       inputPath,
-      srtPath,
+      "-vf",
+      vf,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "18",
+      "-pix_fmt",
+      "yuv420p",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
       outputPath,
-      style: style ?? {},
-    });
+    ];
 
-    // 5️⃣ Upload result
-    const destination = `captioned/${fileId}/output.mp4`;
-    const url = await uploadToGcsAndSign(outputPath, destination);
+    execFileSync("ffmpeg", ffArgs, { stdio: "ignore" });
+
+    // 6) Upload captioned video + signed URL
+    const destination = `${OUTPUT_PREFIX}/${fileId}.mp4`;
+    const videoUrl = await uploadAndSign(outputPath, destination);
 
     return res.json({
       fileId,
-      output: { file: "output.mp4", url },
-      debug: {
-        segmentsReceived: segments.length,
-        segmentsUsed: normalized.length,
-        applyChunkOffsets,
-        segmentSeconds,
-        globalOffsetSeconds,
+      videoUrl,
+      meta: {
+        width: info.width,
+        height: info.height,
+        durationSec: info.durationSec,
+        segments: normalized.length,
+        elapsedMs: Date.now() - startedAt,
+        bucket: BUCKET,
+        destination,
       },
     });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: e?.message || String(e) });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      error: err?.message || String(err),
+    });
+  } finally {
+    safeRmdir(workDir);
   }
 });
+
+app.listen(PORT, () => console.log(`Server running on ${PORT}`));
