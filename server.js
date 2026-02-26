@@ -57,39 +57,25 @@ function getVideoInfo(filePath) {
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
-function srtTime(t) {
-  const msTotal = Math.max(0, Math.round(t * 1000));
-  const ms = msTotal % 1000;
-  const sTotal = Math.floor(msTotal / 1000);
-  const s = sTotal % 60;
-  const mTotal = Math.floor(sTotal / 60);
-  const m = mTotal % 60;
-  const h = Math.floor(mTotal / 60);
-  return `${pad2(h)}:${pad2(m)}:${pad2(s)},${String(ms).padStart(3, "0")}`;
-}
 
 // Minimal wrapping: enforce max 2 lines, try to keep within maxLineLen
 function wrapToTwoLines(text, maxLineLen = 28) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
   if (!t) return "";
 
-  // If already has line breaks, compress to <=2 lines
   const parts = t.split(/\n+/).map((x) => x.trim()).filter(Boolean);
   if (parts.length >= 2) return `${parts[0]}\n${parts[1]}`;
 
-  // If short enough, return as is
   if (t.length <= maxLineLen) return t;
 
-  // Break on nearest space around midpoint, then re-wrap second line if needed
   const mid = Math.floor(t.length / 2);
   let cut = t.lastIndexOf(" ", mid);
   if (cut < 0) cut = t.indexOf(" ", mid);
-  if (cut < 0) return t; // no spaces
+  if (cut < 0) return t;
 
   const line1 = t.slice(0, cut).trim();
   let line2 = t.slice(cut + 1).trim();
 
-  // If second line still too long, try another cut inside line2
   if (line2.length > maxLineLen) {
     const mid2 = Math.floor(line2.length / 2);
     let cut2 = line2.lastIndexOf(" ", mid2);
@@ -102,8 +88,10 @@ function wrapToTwoLines(text, maxLineLen = 28) {
 }
 
 // Better TikTok-style 2-line balancing (prevents huge single-line captions)
+// Returns ASS newline (\\N) between lines.
 function balanceTwoLines(text, maxLen = 20) {
   const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "";
   if (words.length <= 2) return words.join(" ");
 
   let line1 = [];
@@ -130,12 +118,12 @@ function balanceTwoLines(text, maxLen = 20) {
   }
 
   if (!line2.length) return line1.join(" ");
-  return `${line1.join(" ")}\\N${line2.join(" ")}`; // ASS newline
+  return `${line1.join(" ")}\\N${line2.join(" ")}`;
 }
 
 // ASS timestamp format: H:MM:SS.cc (centiseconds)
 function assTime(t) {
-  const csTotal = Math.max(0, Math.round(t * 100)); // centiseconds
+  const csTotal = Math.max(0, Math.round(t * 100));
   const cs = csTotal % 100;
   const sTotal = Math.floor(csTotal / 100);
   const s = sTotal % 60;
@@ -159,20 +147,16 @@ function buildAss({ width, height, events, style }) {
   const fontSize =
     style.fontSize != null
       ? Number(style.fontSize)
-      : Math.round(PlayResY * 0.06); // ~6% of height
+      : Math.round(PlayResY * 0.05); // a bit smaller than before (~5% height)
   const marginV =
     style.bottomMargin != null
       ? Number(style.bottomMargin)
-      : Math.round(PlayResY * 0.09); // ~9% of height
+      : Math.round(PlayResY * 0.11); // slightly higher safe-area
 
-  // ASS style fields:
-  // Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour,
-  // Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle,
-  // BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-  const PrimaryColour = style.highlightColor || "&H00FFFFFF&"; // highlight color
-  const SecondaryColour = style.baseColor || "&H00FFFFFF&";   // base text color
-  const OutlineColour = style.outlineColor || "&H00000000&"; // black
-  const BackColour = style.backColor || "&H64000000&"; // slightly transparent black (mostly unused with BorderStyle=1)
+  const PrimaryColour = style.primaryColor || "&H00FFFFFF&";   // white
+  const SecondaryColour = style.secondaryColor || "&H00FFFFFF&";
+  const OutlineColour = style.outlineColor || "&H00000000&";   // black
+  const BackColour = style.backColor || "&H00000000&";
   const Bold = style.bold === false ? 0 : 1;
 
   const header = `[Script Info]
@@ -194,7 +178,8 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     .map((e) => {
       const txt = String(e.text || "")
         .replace(/\r/g, "")
-        .replace(/\n/g, "\\N") // ASS newline
+        // keep existing ASS newlines; convert normal \n too:
+        .replace(/\n/g, "\\N")
         .replace(/{/g, "\\{")
         .replace(/}/g, "\\}");
       return `Dialogue: 0,${assTime(e.start)},${assTime(e.end)},Default,,0,0,0,,${txt}`;
@@ -246,7 +231,7 @@ async function uploadAndSign(localPath, destination) {
 function normalizeSegments(rawSegments, opts) {
   const segments = Array.isArray(rawSegments) ? rawSegments : [];
 
-  const chunkSeconds = Number(opts.chunkSeconds ?? 0); // if using chunkIndex offsets
+  const chunkSeconds = Number(opts.chunkSeconds ?? 0);
   const defaultOffset = Number(opts.offsetSeconds ?? 0);
 
   const out = segments
@@ -272,7 +257,6 @@ function normalizeSegments(rawSegments, opts) {
     .filter((s) => s.text && s.end > s.start)
     .sort((a, b) => a.start - b.start);
 
-  // Clamp negatives and tiny weirdness
   for (const s of out) {
     if (s.start < 0) s.start = 0;
     if (s.end < 0) s.end = 0;
@@ -288,11 +272,11 @@ function normalizeSegments(rawSegments, opts) {
  * {
  *   "fileId": "driveVideoId",
  *   "segments": [{start,end,text,chunkIndex?}, ...],
- *   "style": { font, fontSize, outline, shadow, bottomMargin, alignment, bold, maxLineLen, wrap },
+ *   "style": { font, fontSize, outline, shadow, bottomMargin, alignment, bold },
  *   "wrap": true,
- *   "maxLineLen": 28,
- *   "chunkSeconds": 0,       // optional, for chunkIndex timing correction
- *   "offsetSeconds": 0       // optional
+ *   "maxLineLen": 20,
+ *   "chunkSeconds": 0,
+ *   "offsetSeconds": 0
  * }
  */
 app.post("/render-captions", async (req, res) => {
@@ -302,12 +286,13 @@ app.post("/render-captions", async (req, res) => {
 
   const style = req.body?.style || {};
   const wrap = req.body?.wrap ?? true;
-  const maxLineLen = Number(req.body?.maxLineLen ?? style.maxLineLen ?? 28);
+
+  // IMPORTANT: for TikTok-like sizing, treat maxLineLen as the balance length
+  const maxLineLen = Number(req.body?.maxLineLen ?? style.maxLineLen ?? 20);
 
   if (!fileId) return res.status(400).json({ error: "Missing fileId" });
   if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
 
-  // Handle case where segments arrived stringified
   if (typeof segments === "string") {
     try {
       segments = JSON.parse(segments);
@@ -316,10 +301,7 @@ app.post("/render-captions", async (req, res) => {
     }
   }
   if (!Array.isArray(segments)) {
-    return res.status(400).json({
-      error: "segments must be an array",
-      got: typeof segments,
-    });
+    return res.status(400).json({ error: "segments must be an array", got: typeof segments });
   }
 
   const workDir = `/tmp/${fileId}-render`;
@@ -330,18 +312,15 @@ app.post("/render-captions", async (req, res) => {
   try {
     safeMkdir(workDir);
 
-    // 1) Download original video
     await downloadDriveFile(fileId, inputPath);
-
-    // 2) Probe for resolution (for auto font sizing)
     const info = getVideoInfo(inputPath);
 
-    // 3) Normalize segments + wrap text
     const normalized = normalizeSegments(segments, {
       chunkSeconds: req.body?.chunkSeconds,
       offsetSeconds: req.body?.offsetSeconds,
     }).map((s) => ({
       ...s,
+      // TikTok-style: balance into two lines using \\N
       text: wrap ? balanceTwoLines(s.text, maxLineLen) : s.text,
     }));
 
@@ -349,20 +328,14 @@ app.post("/render-captions", async (req, res) => {
       return res.status(400).json({ error: "No usable segments after normalization" });
     }
 
-    // 4) Build ASS + write to disk
     const ass = buildAss({
       width: info.width,
       height: info.height,
       events: normalized,
-      style: {
-        ...style,
-        maxLineLen,
-      },
+      style: { ...style },
     });
     fs.writeFileSync(assPath, ass, "utf8");
 
-    // 5) Burn subtitles using libass
-    // Re-encode video for compatibility + faststart
     const vf = `ass=${assPath.replace(/\\/g, "/")}`;
     const ffArgs = [
       "-y",
@@ -389,7 +362,6 @@ app.post("/render-captions", async (req, res) => {
 
     execFileSync("ffmpeg", ffArgs, { stdio: "ignore" });
 
-    // 6) Upload captioned video + signed URL
     const destination = `${OUTPUT_PREFIX}/${fileId}.mp4`;
     const videoUrl = await uploadAndSign(outputPath, destination);
 
@@ -408,9 +380,7 @@ app.post("/render-captions", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({
-      error: err?.message || String(err),
-    });
+    return res.status(500).json({ error: err?.message || String(err) });
   } finally {
     safeRmdir(workDir);
   }
