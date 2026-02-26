@@ -106,6 +106,7 @@ async function uploadPublic(localPath, destination, contentType = "video/mp4") {
 function cleanText(t) {
   return String(t || "")
     .replace(/\u00A0/g, " ")
+    .replace(/\\/g, "")      // ✅ HIER: verwijder elke backslash
     .trim()
     .replace(/\s+/g, " ");
 }
