@@ -63,11 +63,14 @@ function wrapToTwoLines(text, maxLineLen = 28) {
   const t = String(text || "").trim().replace(/\s+/g, " ");
   if (!t) return "";
 
+  // If already has line breaks, compress to <=2 lines
   const parts = t.split(/\n+/).map((x) => x.trim()).filter(Boolean);
   if (parts.length >= 2) return `${parts[0]}\n${parts[1]}`;
 
+  // If short enough, return as is
   if (t.length <= maxLineLen) return t;
 
+  // Break on nearest space around midpoint
   const mid = Math.floor(t.length / 2);
   let cut = t.lastIndexOf(" ", mid);
   if (cut < 0) cut = t.indexOf(" ", mid);
@@ -76,6 +79,7 @@ function wrapToTwoLines(text, maxLineLen = 28) {
   const line1 = t.slice(0, cut).trim();
   let line2 = t.slice(cut + 1).trim();
 
+  // If second line still too long, trim it
   if (line2.length > maxLineLen) {
     const mid2 = Math.floor(line2.length / 2);
     let cut2 = line2.lastIndexOf(" ", mid2);
@@ -88,10 +92,9 @@ function wrapToTwoLines(text, maxLineLen = 28) {
 }
 
 // Better TikTok-style 2-line balancing (prevents huge single-line captions)
-// Returns ASS newline (\\N) between lines.
+// Returns a STRING that may contain "\\N" (ASS newline).
 function balanceTwoLines(text, maxLen = 20) {
   const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (!words.length) return "";
   if (words.length <= 2) return words.join(" ");
 
   let line1 = [];
@@ -118,7 +121,7 @@ function balanceTwoLines(text, maxLen = 20) {
   }
 
   if (!line2.length) return line1.join(" ");
-  return `${line1.join(" ")}\\N${line2.join(" ")}`;
+  return `${line1.join(" ")}\\N${line2.join(" ")}`; // ASS newline
 }
 
 // ASS timestamp format: H:MM:SS.cc (centiseconds)
