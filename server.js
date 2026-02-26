@@ -1,5 +1,21 @@
 // server.js (ESM)
-// Caption renderer for n8n pipeline (Drive -> Cloud Run -> GCS signed URL)
+// Caption renderer service (Drive -> Cloud Run -> GCS public URL)
+// POST /render-captions
+//
+// Body:
+// {
+//   fileId: "driveFileId",
+//   segments: [{ start: 0.0, end: 1.2, text: "..." }, ...],
+//   wrap: true,
+//   maxLineLen: 20,
+//   style: { font, fontSize, bottomMargin, outline, alignment, bold },
+//   outputPrefix: "captioned" // optional
+// }
+//
+// Notes:
+// - Designed for 1080x1920 vertical social video styling.
+// - Produces ASS subtitles (better control than SRT for TikTok styling).
+// - Uploads to BUCKET and returns public URL: https://storage.googleapis.com/<BUCKET>/<destination>
 
 import express from "express";
 import fs from "fs";
@@ -9,11 +25,11 @@ import { google } from "googleapis";
 import { Storage } from "@google-cloud/storage";
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" })); // segments can be big-ish
 
 const PORT = process.env.PORT || 8080;
-const BUCKET = process.env.BUCKET;
-const OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "captioned";
+const BUCKET = process.env.BUCKET; // set this to your PUBLIC bucket: n8n-socialclips-public
+const DEFAULT_OUTPUT_PREFIX = process.env.OUTPUT_PREFIX || "captioned";
 
 const storage = new Storage();
 
@@ -37,167 +53,28 @@ function ffprobeJson(filePath) {
   return JSON.parse(out);
 }
 
-function getVideoInfo(filePath) {
+function getVideoMeta(filePath) {
   try {
     const info = ffprobeJson(filePath);
-    const v = (info?.streams || []).find((s) => s.codec_type === "video");
-    const width = Number(v?.width) || null;
-    const height = Number(v?.height) || null;
     const durationSec = Number(info?.format?.duration);
+    const v = (info?.streams || []).find((s) => s.codec_type === "video");
+    const width = Number(v?.width);
+    const height = Number(v?.height);
     return {
-      width,
-      height,
       durationSec: Number.isFinite(durationSec) ? durationSec : null,
+      width: Number.isFinite(width) ? width : null,
+      height: Number.isFinite(height) ? height : null,
     };
   } catch {
-    return { width: null, height: null, durationSec: null };
+    return { durationSec: null, width: null, height: null };
   }
 }
 
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-
-// Minimal wrapping: enforce max 2 lines, try to keep within maxLineLen
-function wrapToTwoLines(text, maxLineLen = 28) {
-  const t = String(text || "").trim().replace(/\s+/g, " ");
-  if (!t) return "";
-
-  // If already has line breaks, compress to <=2 lines
-  const parts = t.split(/\n+/).map((x) => x.trim()).filter(Boolean);
-  if (parts.length >= 2) return `${parts[0]}\n${parts[1]}`;
-
-  // If short enough, return as is
-  if (t.length <= maxLineLen) return t;
-
-  // Break on nearest space around midpoint
-  const mid = Math.floor(t.length / 2);
-  let cut = t.lastIndexOf(" ", mid);
-  if (cut < 0) cut = t.indexOf(" ", mid);
-  if (cut < 0) return t;
-
-  const line1 = t.slice(0, cut).trim();
-  let line2 = t.slice(cut + 1).trim();
-
-  // If second line still too long, trim it
-  if (line2.length > maxLineLen) {
-    const mid2 = Math.floor(line2.length / 2);
-    let cut2 = line2.lastIndexOf(" ", mid2);
-    if (cut2 < 0) cut2 = line2.indexOf(" ", mid2);
-    if (cut2 > 0) line2 = line2.slice(0, cut2).trim() + "…";
-    else line2 = line2.slice(0, maxLineLen - 1).trim() + "…";
-  }
-
-  return `${line1}\n${line2}`;
-}
-
-// Better TikTok-style 2-line balancing (prevents huge single-line captions)
-// Returns a STRING that may contain "\\N" (ASS newline).
-function balanceTwoLines(text, maxLen = 20) {
-  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
-  if (words.length <= 2) return words.join(" ");
-
-  let line1 = [];
-  let line2 = [];
-  let len = 0;
-
-  for (const w of words) {
-    const add = (line1.length ? 1 : 0) + w.length;
-    if (len + add <= maxLen) {
-      line1.push(w);
-      len += add;
-    } else {
-      line2.push(w);
-    }
-  }
-
-  // Rebalance so line2 isn't too short (prevents 1-word second line)
-  while (
-    line2.length > 0 &&
-    line2.join(" ").length < Math.floor(maxLen * 0.45) &&
-    line1.length > 2
-  ) {
-    line2.unshift(line1.pop());
-  }
-
-  if (!line2.length) return line1.join(" ");
-  return `${line1.join(" ")}\\N${line2.join(" ")}`; // ASS newline
-}
-
-// ASS timestamp format: H:MM:SS.cc (centiseconds)
-function assTime(t) {
-  const csTotal = Math.max(0, Math.round(t * 100));
-  const cs = csTotal % 100;
-  const sTotal = Math.floor(csTotal / 100);
-  const s = sTotal % 60;
-  const mTotal = Math.floor(sTotal / 60);
-  const m = mTotal % 60;
-  const h = Math.floor(mTotal / 60);
-  return `${h}:${pad2(m)}:${pad2(s)}.${String(cs).padStart(2, "0")}`;
-}
-
-// ASS colors are BBGGRR (&HBBGGRR&). We'll keep defaults.
-function buildAss({ width, height, events, style }) {
-  const PlayResX = width || 1080;
-  const PlayResY = height || 1920;
-
-  const font = style.font || "Arial";
-  const alignment = Number(style.alignment ?? 2); // 2 = bottom-center
-  const outline = Number(style.outline ?? 3);
-  const shadow = Number(style.shadow ?? 0);
-
-  // Resolution-aware defaults if not provided:
-  const fontSize =
-    style.fontSize != null
-      ? Number(style.fontSize)
-      : Math.round(PlayResY * 0.05); // a bit smaller than before (~5% height)
-  const marginV =
-    style.bottomMargin != null
-      ? Number(style.bottomMargin)
-      : Math.round(PlayResY * 0.11); // slightly higher safe-area
-
-  const PrimaryColour = style.primaryColor || "&H00FFFFFF&";   // white
-  const SecondaryColour = style.secondaryColor || "&H00FFFFFF&";
-  const OutlineColour = style.outlineColor || "&H00000000&";   // black
-  const BackColour = style.backColor || "&H00000000&";
-  const Bold = style.bold === false ? 0 : 1;
-
-  const header = `[Script Info]
-ScriptType: v4.00+
-PlayResX: ${PlayResX}
-PlayResY: ${PlayResY}
-WrapStyle: 2
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
-Style: Default,${font},${fontSize},${PrimaryColour},${SecondaryColour},${OutlineColour},${BackColour},${Bold},0,0,0,100,100,0,0,1,${outline},${shadow},${alignment},80,80,${marginV},1
-
-[Events]
-Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
-`;
-
-  const body = events
-    .map((e) => {
-      const txt = String(e.text || "")
-        .replace(/\r/g, "")
-        // keep existing ASS newlines; convert normal \n too:
-        .replace(/\n/g, "\\N")
-        .replace(/{/g, "\\{")
-        .replace(/}/g, "\\}");
-      return `Dialogue: 0,${assTime(e.start)},${assTime(e.end)},Default,,0,0,0,,${txt}`;
-    })
-    .join("\n");
-
-  return header + body + "\n";
-}
-
-// 🔹 Download video from Google Drive
+// Download file from Google Drive by fileId
 async function downloadDriveFile(fileId, outputPath) {
   const auth = new google.auth.GoogleAuth({
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
   });
-
   const drive = google.drive({ version: "v3", auth });
 
   const response = await drive.files.get(
@@ -213,133 +90,264 @@ async function downloadDriveFile(fileId, outputPath) {
   });
 }
 
-// 🔹 Upload to GCS + signed URL
-async function uploadAndSign(localPath, destination) {
+// Upload to GCS (public bucket) and return public URL
+async function uploadAndReturnPublicUrl(localPath, destination, contentType = "video/mp4") {
   if (!BUCKET) throw new Error("Missing BUCKET env var");
 
-  await storage.bucket(BUCKET).upload(localPath, {
+  const bucket = storage.bucket(BUCKET);
+  await bucket.upload(localPath, {
     destination,
     resumable: false,
     validation: false,
+    contentType,
   });
 
-  const [url] = await storage.bucket(BUCKET).file(destination).getSignedUrl({
-    action: "read",
-    expires: Date.now() + 60 * 60 * 1000, // 1 hour
-  });
-
-  return url;
+  // Bucket is public -> direct URL works without signing
+  return `https://storage.googleapis.com/${BUCKET}/${destination}`;
 }
 
-function normalizeSegments(rawSegments, opts) {
-  const segments = Array.isArray(rawSegments) ? rawSegments : [];
+// ---------- Caption formatting ----------
 
-  const chunkSeconds = Number(opts.chunkSeconds ?? 0);
-  const defaultOffset = Number(opts.offsetSeconds ?? 0);
+// Normalize text (avoid double spaces, optional comma spacing cleanup)
+function cleanText(t) {
+  return String(t || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/\u00A0/g, " "); // non-breaking spaces
+}
 
-  const out = segments
-    .map((s) => {
-      const start = Number(s.start);
-      const end = Number(s.end);
-      const text = String(s.text || "").trim();
+// Wrap into max 2 lines with maxLineLen (approx char count)
+function wrapTwoLines(text, maxLineLen = 20) {
+  const words = cleanText(text).split(" ").filter(Boolean);
+  if (words.length <= 1) return [cleanText(text)];
 
-      const chunkIndex = s.chunkIndex != null ? Number(s.chunkIndex) : null;
-      const extra =
-        Number.isFinite(chunkSeconds) && chunkSeconds > 0 && Number.isFinite(chunkIndex)
-          ? chunkIndex * chunkSeconds
-          : 0;
+  // greedy build lines, but keep max 2 lines
+  const lines = [];
+  let current = "";
 
-      const offset = Number.isFinite(defaultOffset) ? defaultOffset : 0;
+  for (const w of words) {
+    const next = current ? `${current} ${w}` : w;
+    if (next.length <= maxLineLen || current.length === 0) {
+      current = next;
+    } else {
+      lines.push(current);
+      current = w;
+      if (lines.length === 1) {
+        // continue for second line
+        continue;
+      } else {
+        // already have 2 lines -> pack remainder into line2
+        current = `${lines[1] ? lines[1] + " " : ""}${w}`;
+      }
+    }
+  }
+  if (current) lines.push(current);
 
-      return {
-        start: (Number.isFinite(start) ? start : 0) + extra + offset,
-        end: (Number.isFinite(end) ? end : 0) + extra + offset,
-        text,
-      };
-    })
-    .filter((s) => s.text && s.end > s.start)
-    .sort((a, b) => a.start - b.start);
+  if (lines.length <= 2) return lines;
 
-  for (const s of out) {
-    if (s.start < 0) s.start = 0;
-    if (s.end < 0) s.end = 0;
-    if (s.end <= s.start) s.end = s.start + 0.2;
+  // If we ended up with >2, merge into 2 lines:
+  const first = lines[0];
+  const rest = lines.slice(1).join(" ");
+  return [first, rest];
+}
+
+// Balanced split: try to split into two lines near equal length
+function balanceToTwoLines(text, maxLineLen = 20) {
+  const cleaned = cleanText(text);
+  if (cleaned.length <= maxLineLen) return [cleaned];
+
+  const words = cleaned.split(" ").filter(Boolean);
+  if (words.length <= 2) return wrapTwoLines(cleaned, maxLineLen);
+
+  let best = null;
+  for (let i = 1; i < words.length; i++) {
+    const a = words.slice(0, i).join(" ");
+    const b = words.slice(i).join(" ");
+    if (a.length > maxLineLen * 1.6) continue; // don't make line1 crazy long
+    if (b.length > maxLineLen * 2.2) continue; // avoid insane line2
+    const score = Math.abs(a.length - b.length);
+    if (!best || score < best.score) best = { a, b, score };
   }
 
-  return out;
+  if (best) {
+    // enforce approximate max
+    const a = best.a.length > maxLineLen ? wrapTwoLines(best.a, maxLineLen)[0] : best.a;
+    const bLines = wrapTwoLines(best.b, maxLineLen);
+    return [a, bLines.join(" ")];
+  }
+
+  return wrapTwoLines(cleaned, maxLineLen);
 }
 
-/**
- * POST /render-captions
- * Body:
- * {
- *   "fileId": "driveVideoId",
- *   "segments": [{start,end,text,chunkIndex?}, ...],
- *   "style": { font, fontSize, outline, shadow, bottomMargin, alignment, bold },
- *   "wrap": true,
- *   "maxLineLen": 20,
- *   "chunkSeconds": 0,
- *   "offsetSeconds": 0
- * }
- */
+function toAssTime(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  const hh = Math.floor(s / 3600);
+  const mm = Math.floor((s % 3600) / 60);
+  const ss = Math.floor(s % 60);
+  const cs = Math.floor((s - Math.floor(s)) * 100); // centiseconds
+  const pad = (n, w = 2) => String(n).padStart(w, "0");
+  return `${hh}:${pad(mm)}:${pad(ss)}.${pad(cs)}`;
+}
+
+// Escape ASS special characters
+function assEscape(text) {
+  return String(text)
+    .replace(/\\/g, "\\\\")
+    .replace(/{/g, "\\{")
+    .replace(/}/g, "\\}")
+    .replace(/\r?\n/g, "\\N");
+}
+
+// Build ASS content with TikTok-like defaults
+function buildAss({ segments, wrap, maxLineLen, style, playResX = 1080, playResY = 1920 }) {
+  const s = style || {};
+  const font = s.font || "Arial";
+  const fontSize = Number.isFinite(Number(s.fontSize)) ? Number(s.fontSize) : 54; // TikTok-ish
+  const bottomMargin = Number.isFinite(Number(s.bottomMargin)) ? Number(s.bottomMargin) : 220; // safe-area
+  const outline = Number.isFinite(Number(s.outline)) ? Number(s.outline) : 3;
+  const alignment = Number.isFinite(Number(s.alignment)) ? Number(s.alignment) : 2; // bottom-center
+  const bold = s.bold === false ? 0 : -1; // ASS: -1 = bold, 0 = normal
+
+  // White text + black outline
+  // ASS colors: &HAABBGGRR
+  const primary = "&H00FFFFFF"; // white
+  const outlineColor = "&H00000000"; // black
+  const backColor = "&H64000000"; // slight shadow/box alpha if you later want BorderStyle=3
+
+  const header = [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    `PlayResX: ${playResX}`,
+    `PlayResY: ${playResY}`,
+    "ScaledBorderAndShadow: yes",
+    "WrapStyle: 2", // smart wrap
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, " +
+      "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: Default,${font},${fontSize},${primary},${primary},${outlineColor},${backColor},${bold},0,0,0,100,100,0,0,1,${outline},0,${alignment},80,80,${bottomMargin},1`,
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+  ].join("\n");
+
+  const events = [];
+  for (const seg of segments) {
+    const start = Number(seg.start);
+    const end = Number(seg.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+
+    const text = cleanText(seg.text);
+    if (!text) continue;
+
+    let lines = [text];
+    if (wrap) {
+      // balanced wrapping tends to look more TikTok
+      lines = balanceToTwoLines(text, maxLineLen);
+      if (lines.length > 2) lines = lines.slice(0, 2);
+    }
+
+    const assText = assEscape(lines.join("\\N"));
+    events.push(
+      `Dialogue: 0,${toAssTime(start)},${toAssTime(end)},Default,,0,0,0,,${assText}`
+    );
+  }
+
+  return `${header}\n${events.join("\n")}\n`;
+}
+
+function applyChunkOffsets(segments, segmentSeconds = 0) {
+  // If segments include chunkIndex, add offsets: start += chunkIndex * segmentSeconds
+  const ss = Number(segmentSeconds) || 0;
+  if (!ss) return segments;
+
+  return segments.map((s) => {
+    const ci = Number(s.chunkIndex);
+    if (!Number.isFinite(ci)) return s;
+    return {
+      ...s,
+      start: Number(s.start) + ci * ss,
+      end: Number(s.end) + ci * ss,
+    };
+  });
+}
+
+// ---------- Endpoint ----------
+
 app.post("/render-captions", async (req, res) => {
   const startedAt = Date.now();
-  const { fileId } = req.body || {};
-  let { segments } = req.body || {};
-
-  const style = req.body?.style || {};
-  const wrap = req.body?.wrap ?? true;
-
-  // IMPORTANT: for TikTok-like sizing, treat maxLineLen as the balance length
-  const maxLineLen = Number(req.body?.maxLineLen ?? style.maxLineLen ?? 20);
-
-  if (!fileId) return res.status(400).json({ error: "Missing fileId" });
-  if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
-
-  if (typeof segments === "string") {
-    try {
-      segments = JSON.parse(segments);
-    } catch {
-      return res.status(400).json({ error: "segments is a string but not valid JSON" });
-    }
-  }
-  if (!Array.isArray(segments)) {
-    return res.status(400).json({ error: "segments must be an array", got: typeof segments });
-  }
-
-  const workDir = `/tmp/${fileId}-render`;
-  const inputPath = path.join(workDir, "input.mp4");
-  const assPath = path.join(workDir, "subs.ass");
-  const outputPath = path.join(workDir, "captioned.mp4");
-
   try {
+    if (!BUCKET) return res.status(500).json({ error: "Missing BUCKET env var" });
+
+    const body = req.body || {};
+    const fileId = String(body.fileId || "").trim();
+    let segments = body.segments;
+
+    if (!fileId) return res.status(400).json({ error: "Missing fileId" });
+    if (!segments) return res.status(400).json({ error: "Missing segments" });
+
+    // Allow segments to be passed as a JSON string
+    if (typeof segments === "string") {
+      try {
+        segments = JSON.parse(segments);
+      } catch {
+        return res.status(400).json({ error: "segments must be an array or valid JSON string" });
+      }
+    }
+    if (!Array.isArray(segments)) {
+      return res.status(400).json({ error: "segments must be an array" });
+    }
+
+    // Optional chunk timing correction
+    const segmentSeconds = body.segmentSeconds ?? body.chunkSeconds ?? 0;
+    segments = applyChunkOffsets(segments, segmentSeconds);
+
+    // Reduce to required fields + clean
+    segments = segments
+      .map((s) => ({
+        start: Number(s.start),
+        end: Number(s.end),
+        text: cleanText(s.text),
+      }))
+      .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && s.text);
+
+    if (segments.length === 0) {
+      return res.status(400).json({ error: "segments array is empty after cleaning" });
+    }
+
+    const wrap = body.wrap !== false; // default true
+    const maxLineLen = Number.isFinite(Number(body.maxLineLen)) ? Number(body.maxLineLen) : 20;
+    const style = body.style || {};
+    const outputPrefix = String(body.outputPrefix || DEFAULT_OUTPUT_PREFIX).replace(/^\/+|\/+$/g, "");
+
+    const workDir = `/tmp/${fileId}-render`;
     safeMkdir(workDir);
 
+    const inputPath = path.join(workDir, "input.mp4");
+    const assPath = path.join(workDir, "captions.ass");
+    const outputPath = path.join(workDir, "output.mp4");
+
+    // 1) download original video
     await downloadDriveFile(fileId, inputPath);
-    const info = getVideoInfo(inputPath);
 
-    const normalized = normalizeSegments(segments, {
-      chunkSeconds: req.body?.chunkSeconds,
-      offsetSeconds: req.body?.offsetSeconds,
-    }).map((s) => ({
-      ...s,
-      // TikTok-style: balance into two lines using \\N
-      text: wrap ? balanceTwoLines(s.text, maxLineLen) : s.text,
-    }));
+    const metaIn = getVideoMeta(inputPath);
 
-    if (!normalized.length) {
-      return res.status(400).json({ error: "No usable segments after normalization" });
-    }
-
+    // 2) build ASS (TikTok defaults: fontSize 54, maxLineLen 20, bottomMargin 220)
     const ass = buildAss({
-      width: info.width,
-      height: info.height,
-      events: normalized,
-      style: { ...style },
+      segments,
+      wrap,
+      maxLineLen,
+      style,
+      playResX: 1080,
+      playResY: 1920,
     });
     fs.writeFileSync(assPath, ass, "utf8");
 
-    const vf = `ass=${assPath.replace(/\\/g, "/")}`;
+    // 3) burn subtitles with ffmpeg + libass
+    // Note: subtitles burn requires re-encode video.
+    // Use a sane preset for Cloud Run.
+    const vf = `ass=${assPath.replace(/\\/g, "\\\\").replace(/:/g, "\\:")}`;
+
     const ffArgs = [
       "-y",
       "-i",
@@ -351,7 +359,7 @@ app.post("/render-captions", async (req, res) => {
       "-preset",
       "veryfast",
       "-crf",
-      "18",
+      "20",
       "-pix_fmt",
       "yuv420p",
       "-c:a",
@@ -363,30 +371,56 @@ app.post("/render-captions", async (req, res) => {
       outputPath,
     ];
 
-    execFileSync("ffmpeg", ffArgs, { stdio: "ignore" });
+    // Show ffmpeg output in Cloud Run logs (super helpful)
+    execFileSync("ffmpeg", ffArgs, { stdio: "inherit" });
 
-    const destination = `${OUTPUT_PREFIX}/${fileId}.mp4`;
-    const videoUrl = await uploadAndSign(outputPath, destination);
+    const metaOut = getVideoMeta(outputPath);
 
+    // 4) upload to GCS public bucket
+    const destination = `${outputPrefix}/${fileId}.mp4`;
+    const videoUrl = await uploadAndReturnPublicUrl(outputPath, destination, "video/mp4");
+
+    // 5) respond
     return res.json({
       fileId,
       videoUrl,
       meta: {
-        width: info.width,
-        height: info.height,
-        durationSec: info.durationSec,
-        segments: normalized.length,
+        width: metaOut.width ?? metaIn.width,
+        height: metaOut.height ?? metaIn.height,
+        durationSec: metaOut.durationSec ?? metaIn.durationSec,
+        segments: segments.length,
         elapsedMs: Date.now() - startedAt,
         bucket: BUCKET,
         destination,
+        styleUsed: {
+          font: style.font || "Arial",
+          fontSize: Number.isFinite(Number(style.fontSize)) ? Number(style.fontSize) : 54,
+          bottomMargin: Number.isFinite(Number(style.bottomMargin)) ? Number(style.bottomMargin) : 220,
+          outline: Number.isFinite(Number(style.outline)) ? Number(style.outline) : 3,
+          alignment: Number.isFinite(Number(style.alignment)) ? Number(style.alignment) : 2,
+          bold: style.bold === false ? false : true,
+          maxLineLen,
+          wrap,
+        },
       },
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err?.message || String(err) });
+    console.error("render-captions error:", err);
+
+    // Make Google API errors readable
+    const status = err?.code || err?.response?.status || 500;
+    const details = err?.response?.data;
+
+    return res.status(500).json({
+      error: err?.message || String(err),
+      status,
+      details,
+    });
   } finally {
-    safeRmdir(workDir);
+    // cleanup tmp
+    const fileId = String(req.body?.fileId || "").trim();
+    if (fileId) safeRmdir(`/tmp/${fileId}-render`);
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`Caption renderer listening on ${PORT}`));
